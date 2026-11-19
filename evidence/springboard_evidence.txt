@@ -1,0 +1,56 @@
+=== SpringBoard rendering proof (run-sb-unblock.log, cycle14: 2026-11-19) ===
+hakios-gl: frame 1220: 28 GL calls, 4 draws, 8 triangles, 1 clears; 0 textures refilled from IOSurfaces (0 KB); 1 picture copied out, 0 drawn in place; 3448370 us (101049 handing on, 39 waiting, 141453 copying out), 0 before it for the IOSurfaces
+
+=== GL frames in that run: 48 ===
+
+=== darwin/ufs write-back proof (kernel_springboard70.txt) ===
+ufs: unit 1: path 1.4[77d4908da339384aab9e586ff69ed051]
+ufs: unit 2: path 1.4[6858f8edec87774f9cda5f10df2fe601]
+ufs: unit 3: path 1.4[2490e61aeb8af84dbc980032dbdf5024]
+ufs: unit 4: path 1.4[85193fd307f1854abe3868dc7ad32cea]
+ufs: unit 5: path 1.4[5fd0a14b8e083f48a97eb19b9ccf59b0]
+ufs: darwin (a file of userdata): its blocks from 2042368 on may be written this run
+ufs: block service: 90 partitions and 6 units, page a1457000, buffer a1571000 of 4096 KB
+ufs: 5 writes into darwin, 16781312 bytes, read back the same; 0 refused
+
+=== Last 40 lines of run-sb-unblock.log ===
+hakios: t7#6 Foundation <redacted>+0xd0
+hakios: t7#7 Foundation <redacted>+0x3c
+hakios: t7#8 UIKitCore <redacted>+0x194
+hakios: t7#9 Foundation <redacted>+0x2c0
+hakios: t7#10 libsystem_pthread.dylib _pthread_start+0x74
+hakios: t7#11 libsystem_pthread.dylib thread_start+0x8
+hakios: t8 libsystem_kernel.dylib mach_msg2_trap+0x8
+hakios: t8#1 libsystem_kernel.dylib mach_msg_overwrite+0x1e4
+hakios: t8#2 libsystem_kernel.dylib mach_msg+0x14
+hakios: t8#3 CoreFoundation <redacted>+0x9c
+hakios: t8#4 CoreFoundation <redacted>+0x4b8
+hakios: t8#5 CoreFoundation CFRunLoopRunSpecific+0x248
+hakios: t8#6 CoreFoundation CFRunLoopRun+0x3c
+hakios: t8#7 CoreMotion _ZN16CLMotionActivity15isTypeInVehicleENS_4TypeE+0x5af8
+hakios: t8#8 libsystem_pthread.dylib _pthread_start+0x74
+hakios: t8#9 libsystem_pthread.dylib thread_start+0x8
+hakios: t9 libsystem_kernel.dylib __workq_kernreturn+0x8
+hakios: t9#1 libsystem_pthread.dylib start_wqthread+0x8
+
+[hb]
+[p1 r=-1 fl=0 st=0 xst=0 pid=0]
+
+[hb]
+[p1 r=-1 fl=0 st=0 xst=0 pid=0]
+
+[hb]
+[p1 r=-1 fl=0 st=0 xst=0 pid=0]
+
+[hb]
+[p1 r=-1 fl=0 st=0 xst=0 pid=0]
+
+[hb]
+[p1 r=-1 fl=0 st=0 xst=0 pid=0]
+t
+
+--- loader_return_after expired ---
+var_store: saving into slot 0 (slot -1 holds generation 0)
+
+[hb]
+[p1 r=-1 fl=0 st=0 xst=0 pid=0]

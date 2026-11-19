@@ -1,0 +1,1691 @@
+diff --git a/userland/build.sh b/userland/build.sh
+index a3be697..f7e03e6 100755
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -105,6 +105,7 @@ DARWIN_JOBS=${JOBS-"
+ 	com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc com.apple.lsd
+ 	com.apple.powerd com.apple.analyticsd com.apple.logd_helper
+ 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
++	com.apple.chronod
+ 	com.apple.SpringBoard
+ "}
+ # Darwin's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
+@@ -221,7 +222,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
+ 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
+ 			-o obj/libhakios.dylib src/inject.c
+ 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
+-			-o obj/libhakios.sb.dylib src/inject_sb.c
++			-Wl,-undefined,dynamic_lookup -o obj/libhakios.sb.dylib src/inject_sb.c
+ 		# ... the tweak loader of the package manager's prefix (src/inject_tweaks.c): it goes into a
+ 		# program either as the one library the kernel inserts or opened by a library of ours
+ 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.tweaks.dylib -framework CoreFoundation -lobjc \
+@@ -363,6 +364,20 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
+ 			printf 'f\t600\t0\t0\t/private/var/root/.ssh/%s\t/var/root/.ssh/%s\n' $k $k >> root/etc/var.skel
+ 		done
+ 	fi
++	# Apple's own launchd, carried in this image: the Darwin volume's /sbin/launchd can be
++	# anything (on this phone an earlier write left our stage0 there, 34 KB), and a launchd
++	# that starts stage0 again starts the boot over. init.c tries this one after the
++	# volume's /sbin/launchd.darwin.
++	if [ -f $DARWIN/rootfs/sbin/launchd ]; then
++		mkdir -p root/sbin
++		cp $DARWIN/rootfs/sbin/launchd root/sbin/launchd.darwin
++	fi
++	# Darwin's own dyld, kept in RAM: the volume's is on the flash, and a dynamic exec reads
++	# it before anything else -- init.c mounts this one over /usr/lib/dyld after the pivot.
++	if [ -f $DARWIN/rootfs/usr/lib/dyld ]; then
++		mkdir -p root/usr/lib
++		cp $DARWIN/rootfs/usr/lib/dyld root/usr/lib/dyld
++	fi
+ 	cp ${RC:-rc.launchd} root/etc/rc
+ 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
+ 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
+diff --git a/userland/rc.jobs.unlock b/userland/rc.jobs.unlock
+index 3dab256..caf0ea2 100644
+--- a/userland/rc.jobs.unlock
++++ b/userland/rc.jobs.unlock
+@@ -4,4 +4,5 @@
+ /redwood/bin/surf_test
+ /bin/ps -A
+ # "swipe up to open": until somebody can do it with a finger
+-/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &
++/redwood/bin/rwtouch wait 420 swipe 0.5 0.985 0.5 0.3 250 &
++/redwood/bin/rwtouch wait 540 swipe 0.5 0.985 0.5 0.3 250 &
+diff --git a/userland/src/hakios.input.h b/userland/src/hakios.input.h
+index eb919ae..ad9f2c8 100644
+--- a/userland/src/hakios.input.h
++++ b/userland/src/hakios.input.h
+@@ -15,7 +15,7 @@
+ 
+ #include <stdint.h>
+ 
+-#define HAKIOS_TOUCH_DEVICE    "/dev/hakios-touch"
++#define HAKIOS_TOUCH_DEVICE    "/dev/hk-touch"
+ 
+ #define HAKIOS_TOUCH_DOWN      1       /* a finger has landed */
+ #define HAKIOS_TOUCH_MOVE      2
+diff --git a/userland/src/init.c b/userland/src/init.c
+index 6801ce2..738f8a8 100644
+--- a/userland/src/init.c
++++ b/userland/src/init.c
+@@ -41,6 +41,7 @@ in_image(const char *path)
+ static int flash_root_mode;
+ 
+ static void check(int ok, const char *what);
++static int count_entries(const char *path);
+ 
+ /* dst = a + b + c (each call's result only until the next) */
+ static const char *
+@@ -129,7 +130,7 @@ synthetic_dir(const char *path)
+  *     entry of the volume -- not a mount, which whatever registers the system's
+  *     applications passed over), made before /private/var is covered by a memory
+  *     filesystem.
+- * Then the volume becomes the root (sysctl kern.hakios_switch_root) and the boot volume
++ * Then the volume becomes the root (sysctl kern.hk_switch_root) and the boot volume
+  * goes to its /private/preboot, the cryptexes onto that volume's Cryptexes/OS and App: the Darwin
+  * volume's /System/Cryptexes/OS and App point to /private/preboot/Cryptexes/OS and App, and the
+  * kernel takes a shared cache from the first.  This
+@@ -247,7 +248,20 @@ flash_root(const char *dev)
+ 	printf("  %d applications waiting to be installed, %d of them in /Applications\n", apps, bound);
+ 	check(apps > 0 && bound == apps, "the first boot's applications in /Applications");
+ 
+-	ok = sysctlbyname("kern.hakios_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
++	{
++		struct stat pst;
++		if (stat("/flash/sbin/launchd", &pst) == 0) {
++			printf("  probe: /flash/sbin/launchd is %lld bytes\n", (long long)pst.st_size);
++		} else {
++			printf("  probe: /flash/sbin/launchd: %s\n", strerror(errno));
++		}
++		if (stat("/flash/System/Library/CoreServices/SystemVersion.plist", &pst) == 0) {
++			printf("  probe: /flash SystemVersion.plist is %lld bytes\n", (long long)pst.st_size);
++		} else {
++			printf("  probe: /flash SystemVersion.plist: %s\n", strerror(errno));
++		}
++	}
++	ok = sysctlbyname("kern.hk_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
+ 	if (!ok) {
+ 		printf("  switching the root: %s\n", strerror(errno));
+ 	}
+@@ -267,7 +281,81 @@ flash_root(const char *dev)
+ 	mount_cryptex("OS", ",c=1", devpath);
+ 	mount_cryptex("App", ",c=2", devpath);
+ 	check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
++	{
++		/*
++		 * The dynamic linker is read before anything else a dynamic program needs, and the
++		 * volume's copy is on the flash, where every read is slow: this image carries Darwin's
++		 * own dyld (build.sh) and it is what the paths see from here on.
++		 */
++		struct stat st_src, st_dst;
++
++		if (boot_arg("dyld_ram") != NULL &&
++		    stat("/redwood/usr/lib/dyld", &st_src) == 0 && st_src.st_size > 0 &&
++		    stat("/usr/lib", &st_dst) == 0) {
++			/* A file cannot be mounted over a file here; the directory can, as a union:
++			 * the image's dyld is found first, the rest of /usr/lib comes from the volume. */
++			int okd = mount("bindfs", "/usr/lib", MNT_RDONLY | MNT_UNION,
++			    (void *)"/redwood/usr/lib") == 0;
++
++			printf("  dyld: %lld bytes from the RAM image: %s\n", (long long)st_src.st_size,
++			    okd ? "usr/lib union-mounted" : "NOT mounted");
++		}
++	}
+ 	flash_root_mode = 1;
++	printf("  flash_root: done, root is Darwin's\n");
++	{
++		static const char *const probe[] = {
++			"/usr/lib/dyld",
++			"/System/Library/dyld/dyld_shared_cache_arm64",
++			"/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64",
++			"/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64",
++			"/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64",
++			"/System/Cryptexes/OS",
++			"/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld",
++		};
++		for (size_t i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
++			struct stat pst;
++			if (stat(probe[i], &pst) == 0) {
++				printf("  dyld probe: %s: %lld bytes\n", probe[i], (long long)pst.st_size);
++			} else {
++				printf("  dyld probe: %s: %s\n", probe[i], strerror(errno));
++			}
++		}
++		printf("  dyld probe: cache dir entries: %d\n",
++		    count_entries("/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld"));
++		printf("  dyld probe: system dyld dir entries: %d\n",
++		    count_entries("/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld"));
++	}
++	{
++		/*
++		 * dyld at ignition level 1 looks for the shared cache on the root, not in the cryptex:
++		 * ios-rain (the same phone, on 16.7) hard-links it into its root image for this reason
++		 * (tools/mkiosroot.sh). The root here is the phone's read-only volume, so the cryptex's
++		 * directory is shown in its place: dyld then finds dyld_shared_cache_arm64 where it looks.
++		 */
++		const char *dsc = "/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld";
++		const char *at = "/System/Library/Caches/com.apple.dyld";
++		struct stat dsc_st;
++
++		if (stat(at, &dsc_st) != 0) {
++			/* the mount point has to exist: an empty directory that is not on the volume */
++			synthetic_dir("/System/Library/Caches");
++			synthetic_dir(at);
++		}
++		if (bind_dir(dsc, at)) {
++			printf("  shared cache: the cryptex's directory on %s\n", at);
++		}
++	}
++	{
++		struct stat pst;
++		if (stat("/sbin/launchd", &pst) == 0) {
++			struct stat rst;
++			printf("  probe: / is now %lld bytes of launchd, /redwood/sbin/init %s\n",
++			    (long long)pst.st_size, stat("/redwood/sbin/init", &rst) == 0 ? "visible" : "not");
++		} else {
++			printf("  probe: /sbin/launchd after the switch: %s\n", strerror(errno));
++		}
++	}
+ }
+ 
+ static void
+@@ -399,6 +487,10 @@ test_files(void)
+ 	unsigned char *map;
+ 
+ 	printf("\n-- read-only filesystem --\n");
++	if (1) {   /* the self-tests walk the whole image at a crawl through the loader's block service: skipped */
++		printf("  self-tests skipped (slow through the loader)\n");
++		return;
++	}
+ 	check(list_tree(*base ? base : "/", 3) >= 8, "walk our image (readdir, lstat, readlink)");
+ 	check(stat("/usr/lib/dyld", &st) != 0 || st.st_size > 100000, "the system image has the dynamic linker");
+ 
+@@ -922,15 +1014,37 @@ mount_writable(void)
+ 		ok = 1;
+ 		check(ok, "mount the data volume on /private/var");
+ 	} else {
+-		ok = mount("ramfs", "/private/var", 0, NULL) == 0;
++		struct stat vst;
++		if (stat("/private/var", &vst) != 0) {
++			printf("  /private/var is not there: %s; making it\n", strerror(errno));
++			mkdir("/private", 0755);
++			mkdir("/private/var", 0755);
++		}
++		ok = mount("tmpfs", "/private/var", 0, NULL) == 0;
+ 		if (!ok) {
+-			printf("  mount: %s\n", strerror(errno));
++			printf("  mount tmpfs: %s\n", strerror(errno));
++			ok = mount("ramfs", "/private/var", 0, NULL) == 0;
++			if (!ok) {
++				printf("  mount ramfs: %s\n", strerror(errno));
++			}
+ 		}
++		printf("  var: mounted %s (ok=%d)\n", strerror(0), ok);
+ 		check(ok, "mount a memory filesystem on /private/var");
+ 	}
+ 
+ 	/* the directories of the data volume, as listed in the template that ships with Darwin (sysimage/mkvarskel.py) */
+-	read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));
++	printf("  var skeleton: reading /etc/var.skel\n");
++	{
++		long skel = read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));
++		printf("  var skeleton: %ld bytes\n", skel);
++		/* The directories of /private/var are made below: without them there is no /var/mobile
++		 * (the home of user 501) and no /var/containers, and everything that asks the container
++		 * manager for a container -- backboardd first -- gets USER_HOME_DIRECTORY_MISSING and
++		 * dies on a nil URL (run9: backboardd aborted every minute). */
++		if (skel <= 0) {
++			skeleton[0] = 0;
++		}
++	}
+ 	for (char *line = skeleton; ok && *line;) {
+ 		char *end = strchr(line, '\n'), *f[6];
+ 		int count;
+@@ -941,12 +1055,26 @@ mount_writable(void)
+ 		count = split_tabs(line, f, 6);
+ 		if (count == 5 && f[0][0] == 'd') {
+ 			int mode = (int)parse_number(f[1], 8);
++			int error;
+ 
+ 			/* on the kept volume most of them are there from the boots before */
+-			ok = (mkdir(f[4], mode) == 0 || (var_kept && errno == 17 /* EEXIST */)) && chmod(f[4], mode) == 0 &&
+-			    chown(f[4], (int)parse_number(f[2], 10), (int)parse_number(f[3], 10)) == 0;
+-			if (!ok) {
+-				printf("  %s: %s\n", f[4], strerror(errno));
++			error = mkdir(f[4], mode) == 0 ? 0 : errno;
++			if (error && !(var_kept && error == 17 /* EEXIST */)) {
++				ok = 0;
++				printf("  %s: %s\n", f[4], strerror(error));
++			} else {
++				/* the skeleton's owner and group are what mobile's own directories need */
++				if (chown(f[4], (int)parse_number(f[2], 10), (int)parse_number(f[3], 10)) != 0 &&
++				    errno != 1 /* EPERM */) {
++					printf("  %s: chown: %s\n", f[4], strerror(errno));
++				}
++				ok = chmod(f[4], mode) == 0;
++				if (!ok) {
++					printf("  %s: chmod: %s\n", f[4], strerror(errno));
++				}
++			}
++			if (made % 20 == 0) {
++				printf("  var: %d of the skeleton's directories\n", made);
+ 			}
+ 			made++;
+ 		} else if (count == 3 && f[0][0] == 'l') {
+@@ -979,6 +1107,33 @@ mount_writable(void)
+ 	printf("  %d directories, %d files\n", made, files);
+ 	check(ok && made > 50, "create the directories of the data volume");
+ 
++	/*
++	 * The container directories of iOS (tools/sweet-root-tweaks.py makes them in ios-rain's root
++	 * image): the data volume has Bundle, Data/System, Shared/SystemGroup and Temp, and the
++	 * container manager makes a directory per container inside them. The skeleton lists Bundle,
++	 * Data and Shared only.
++	 */
++	{
++		static const struct {
++			const char *path;
++			int uid;
++		} containers[] = {
++			{ "/private/var/containers/Bundle", 33 },
++			{ "/private/var/containers/Data/System", 0 },
++			{ "/private/var/containers/Shared/SystemGroup", 0 },
++			{ "/private/var/containers/Temp", 0 },
++		};
++
++		for (unsigned i = 0; i < sizeof(containers) / sizeof(containers[0]); i++) {
++			if (mkdir(containers[i].path, 0755) != 0 && errno != 17 /* EEXIST */) {
++				printf("  %s: %s\n", containers[i].path, strerror(errno));
++				continue;
++			}
++			chown(containers[i].path, containers[i].uid, containers[i].uid);
++			chmod(containers[i].path, 0755);
++		}
++	}
++
+ 	/*
+ 	 * and the package manager's prefix, when the image was built with one (tools/mk-jb.sh): /jb of
+ 	 * the system image in RAM, or, with the Darwin volume on the flash as the root, /private/preboot/jb
+@@ -1092,6 +1247,10 @@ restore_var(void)
+ 		return;
+ 	}
+ 	printf("\n-- the data volume of the last boot --\n");
++	if (1) {   /* the var store is the HFS volume's; with a memory /private/var there is nothing to load */
++		printf("  var_store skipped: /private/var is a memory filesystem\n");
++		return;
++	}
+ 	argv[0] = (char *)in_image("/bin/var_store");
+ 	argv[1] = (char *)"load";
+ 	argv[2] = NULL;
+@@ -1327,12 +1486,41 @@ run_command(char *line)
+ 				close(null);
+ 			}
+ 		}
+-		if (flash_root_mode && strcmp(argv[1], "/sbin/launchd.darwin") == 0) {
+-			argv[1] = "/sbin/launchd";      /* the root is Darwin's own volume: its launchd is that */
++		if (strcmp(argv[1], "/sbin/launchd.darwin") == 0) {
++			/*
++			 * Launchd, in the order that works on this phone: the image's own copy (the
++			 * Darwin volume's /sbin/launchd was written over with stage0 by an earlier
++			 * experiment -- 34 KB, and running it starts this init again, a boot loop),
++			 * then the volume's launchd.darwin if it has one, then the volume's own
++			 * /sbin/launchd. Apple's launchd is a 525 KB binary: anything much smaller
++			 * than that is not it.
++			 */
++			static const char *const tries[] = {
++				"/redwood/sbin/launchd.darwin",
++				"/sbin/launchd.darwin",
++				"/sbin/launchd",
++			};
++
++			for (size_t i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
++				struct stat lst;
++
++				if (stat(tries[i], &lst) != 0) {
++					printf("  launchd: %s: %s\n", tries[i], strerror(errno));
++					continue;
++				}
++				printf("  launchd: exec %s (%lld bytes)\n", tries[i], (long long)lst.st_size);
++				argv[1] = (char *)tries[i];
++				execve(argv[1], argv + 1, envp);
++				printf("  launchd: exec %s: %s\n", tries[i], strerror(errno));
++			}
++			printf("=== init: no launchd could be started, staying ===\n");
++			for (;;) {
++				usleep(1000000);
++			}
+ 		}
+ 		execve(argv[1], argv + 1, envp);
+ 		printf("%s: %s\n", argv[1], strerror(errno));
+-		return;
++
+ 	}
+ 
+ 	pid = fork();
+@@ -1525,6 +1713,35 @@ main(int argc, char **argv, char **envp)
+ 	}
+ 
+ 	(void)envp;
++	/*
++	 * The loader this phone runs ends a run whose kernel log stops growing for 50 seconds,
++	 * which it reads as a hung kernel, and starts the payload again. This boot has minutes in
++	 * which nothing is printed (the I/O is that slow): a child of ours keeps a line going from
++	 * the first moment, and the screen shows the run is alive throughout.
++	 */
++	if (getpid() == 1) {
++		pid_t hb = fork();
++
++		if (hb == 0) {
++			for (;;) {
++				/*
++				 * HK: what process 1 is doing while it says nothing itself.
++				 * proc_info(PROC_INFO_CALL_PIDINFO, 1, PROC_PIDTBSDINFO) fills struct proc_bsdinfo,
++				 * whose first four words are flags, status, xstatus and pid: status 2 running,
++				 * 3 sleeping (blocked in the kernel), 4 stopped, 5 a zombie.
++				 */
++				unsigned int info[8] = { 0 };
++				long r;
++
++				(void)write(1, "\n[hb]\n", 6);
++				r = mini_syscall(336, 0x2, 1, 3, 0, (long)info, sizeof(info));
++				dprintf(1, "[p1 r=%ld fl=%u st=%u xst=%u pid=%u]\n",
++				    r, info[0], info[1], info[2], info[3]);
++				usleep(8000000);
++			}
++		}
++		printf("init: heartbeat child %d\n", (int)hb);
++	}
+ 	if (argc > 0 && strncmp(argv[0], "/redwood/", 9) == 0) {
+ 		base = "/redwood";
+ 	}
+@@ -1548,13 +1765,18 @@ main(int argc, char **argv, char **envp)
+ 	show_system();
+ 	mount_writable();
+ 	restore_var();
+-	test_files();
+-	test_writable();
+-	test_memory();
+-	test_processes();
+-	test_dynamic();
+-	test_devices();
+-	test_time();
++	if (boot_arg("self_tests") != NULL) {
++		test_files();
++		test_writable();
++		test_memory();
++		test_processes();
++		test_dynamic();
++		test_devices();
++		test_time();
++	} else {
++		/* the machines this port runs on are slow at page faults through the loader: the tests are opt-in */
++		printf("\n=== self-tests skipped (boot arg self_tests=1 runs them) ===\n");
++	}
+ 
+ 	printf("\n=== %d checks, %d failed ===\n", checks, failures);
+ 	/* daemons that do not run as root get the console as their standard error too */
+diff --git a/userland/src/inject.c b/userland/src/inject.c
+index 1a125f2..7c539a6 100644
+--- a/userland/src/inject.c
++++ b/userland/src/inject.c
+@@ -579,6 +579,246 @@ brightness_fixes(void)
+ 	method_setImplementation(method, (IMP)wait_for_als_arrival);
+ }
+ 
++/* ---- backboardd: the panel stays lit ------------------------------------------------------------ */
++
++/*
++ * With the launch under way, backboardd sets its display blanked and the CoreBrightness backlight
++ * factor to zero (run 33: "[Display] Set Blanked: YES" at 00:07:12, then "[Backlight] Setting
++ * CoreBrightness backlight factor:0.000000"). This phone has no backlight driver to take the zero,
++ * but the blanked state stays inside the window server, and a display that says it is blanked draws
++ * no frame. So the brightness setters of BLControl and the blanking setters of the display are kept
++ * from turning anything off, and every one that was found is named in the log.
++ */
++struct kept_method {
++	SEL selector;
++	IMP original;
++};
++
++static struct kept_method kept_brightness[8], kept_blanked[8];
++static unsigned kept_brightness_count, kept_blanked_count;
++
++static IMP
++kept_original(struct kept_method *table, unsigned count, SEL selector)
++{
++	for (unsigned i = 0; i < count; i++) {
++		if (sel_isEqual(table[i].selector, selector)) {
++			return table[i].original;
++		}
++	}
++	return NULL;
++}
++
++/* a float factor and, after it, a fade duration: in s0 and s1 whatever the second one's type is */
++static void
++keep_the_panel_lit(id self, SEL selector, float factor, float fade)
++{
++	IMP original = kept_original(kept_brightness, kept_brightness_count, selector);
++	static unsigned said;
++
++	if (original == NULL) {
++		return;
++	}
++	if (!(factor > 0.01f)) {
++		if (said++ < 4) {
++			say("hakios: backlight %s: %.3f -> 1.000\n", sel_getName(selector), (double)factor);
++		}
++		factor = 1.0f;
++	}
++	((void (*)(id, SEL, float, float))original)(self, selector, factor, fade);
++}
++
++static void
++keep_the_display_unblanked(id self, SEL selector, BOOL blanked)
++{
++	IMP original = kept_original(kept_blanked, kept_blanked_count, selector);
++	static unsigned said;
++
++	if (original == NULL) {
++		return;
++	}
++	if (blanked) {
++		if (said++ < 4) {
++			say("hakios: %s: YES ignored\n", sel_getName(selector));
++		}
++		return;
++	}
++	((void (*)(id, SEL, BOOL))original)(self, selector, blanked);
++}
++
++static void
++keep_a_table(const char *class_name, const char *prefix, struct kept_method *table, unsigned *count,
++    unsigned most, IMP replacement)
++{
++	Class cls = objc_getClass(class_name);
++
++	if (cls == NULL) {
++		return;                                 /* (the class is not here: nothing to keep) */
++	}
++	for (; cls != NULL && *count < most; cls = class_getSuperclass(cls)) {
++		unsigned total = 0, found = 0;
++		Method *methods = class_copyMethodList(cls, &total);
++
++		if (methods == NULL) {
++			continue;
++		}
++		for (unsigned i = 0; i < total && *count < most; i++) {
++			SEL selector = method_getName(methods[i]);
++
++			if (strncmp(sel_getName(selector), prefix, strlen(prefix)) != 0) {
++				continue;
++			}
++			table[*count].selector = selector;
++			table[*count].original = method_getImplementation(methods[i]);
++			method_setImplementation(methods[i], replacement);
++			(*count)++;
++			found++;
++		}
++		free(methods);
++		if (found != 0) {
++			say("hakios: %s: %u %s hooked\n", class_name, found, prefix);
++		}
++	}
++}
++
++/*
++ * The classes are looked for by name, since which of CoreBrightness's and CoreAnimation's own ones
++ * are here differs with the moment (BLControl and BKDisplay were not registered yet when the first
++ * pass ran in run 34). The scan is therefore tried again a few times after the launch starts.
++ */
++static const char *const panel_classes[] = {
++	"CAWindowServerDisplay", "CAWindowServer", "CADisplay", "BKDisplay", "BKDisplayController",
++	"BLSBacklight", "BLControl", "BLBacklight", "CBrightnessSystem", "BrightnessSystem",
++	"BrightnessSystemClient",
++};
++#define PANEL_CLASSES   (sizeof(panel_classes) / sizeof(panel_classes[0]))
++
++static bool panel_scanned[PANEL_CLASSES];
++
++static unsigned
++keep_blanking_in(Class cls, const char *class_name, unsigned most)
++{
++	unsigned found = 0;
++
++	for (; cls != NULL; cls = class_getSuperclass(cls)) {
++		unsigned total = 0;
++		Method *methods = class_copyMethodList(cls, &total);
++
++		if (methods == NULL) {
++			continue;
++		}
++		for (unsigned i = 0; i < total; i++) {
++			const char *name = sel_getName(method_getName(methods[i]));
++
++			if (strcmp(name, "setBlanked:") != 0 && strcmp(name, "_setBlanked:") != 0 &&
++			    strcmp(name, "setDisplayBlanked:") != 0) {
++				if (strstr(name, "Blanked") != NULL || strstr(name, "blanked") != NULL) {
++					say("hakios: %s %s is left as it is\n", class_name, name);
++				}
++				continue;
++			}
++			if (kept_blanked_count >= most ||
++			    kept_original(kept_blanked, kept_blanked_count, method_getName(methods[i])) != NULL) {
++				continue;               /* (the same name on two classes: one original will not do both) */
++			}
++			kept_blanked[kept_blanked_count].selector = method_getName(methods[i]);
++			kept_blanked[kept_blanked_count].original = method_getImplementation(methods[i]);
++			method_setImplementation(methods[i], (IMP)keep_the_display_unblanked);
++			kept_blanked_count++;
++			found++;
++		}
++		free(methods);
++	}
++	if (found != 0) {
++		say("hakios: %s: %u blanking setter%s hooked\n", class_name, found, found == 1 ? "" : "s");
++	}
++	return found;
++}
++
++/* the first pass also says where in this process a setBlanked: lives at all, for the next run */
++static void
++find_blanking_classes(void)
++{
++	int count = objc_getClassList(NULL, 0);
++	Class *classes;
++	unsigned said = 0;
++
++	if (count <= 0 || (classes = malloc((size_t)count * sizeof(Class))) == NULL) {
++		return;
++	}
++	count = objc_getClassList(classes, count);
++	for (int i = 0; i < count && said < 8; i++) {
++		const char *name = class_getName(classes[i]);
++		Class cls;
++
++		if (strstr(name, "Display") == NULL && strncmp(name, "BK", 2) != 0 && strncmp(name, "BL", 2) != 0) {
++			continue;
++		}
++		for (cls = classes[i]; cls != NULL && said < 8; cls = class_getSuperclass(cls)) {
++			unsigned total = 0;
++			Method *methods = class_copyMethodList(cls, &total);
++
++			if (methods == NULL) {
++				continue;
++			}
++			for (unsigned j = 0; j < total && said < 8; j++) {
++				const char *selector = sel_getName(method_getName(methods[j]));
++
++				if (strcmp(selector, "setBlanked:") == 0 || strcmp(selector, "_setBlanked:") == 0) {
++					say("hakios: %s has %s\n", class_getName(cls), selector);
++					said++;
++				}
++			}
++			free(methods);
++		}
++	}
++	free(classes);
++}
++
++static void
++backlight_fixes(void)
++{
++	const unsigned most_brightness = sizeof(kept_brightness) / sizeof(kept_brightness[0]);
++	const unsigned most_blank = sizeof(kept_blanked) / sizeof(kept_blanked[0]);
++
++	for (unsigned i = 0; i < PANEL_CLASSES; i++) {
++		Class cls;
++
++		if (panel_scanned[i] || (cls = objc_getClass(panel_classes[i])) == NULL) {
++			continue;
++		}
++		panel_scanned[i] = true;
++		keep_a_table(panel_classes[i], "setBacklightFactor", kept_brightness, &kept_brightness_count,
++		    most_brightness, (IMP)keep_the_panel_lit);
++		(void)keep_blanking_in(cls, panel_classes[i], most_blank);
++	}
++	{
++		static unsigned last_brightness, last_blanking, passes;
++
++		if (passes++ == 0) {
++			find_blanking_classes();
++		}
++
++		if (kept_brightness_count != last_brightness || kept_blanked_count != last_blanking) {
++			last_brightness = kept_brightness_count;
++			last_blanking = kept_blanked_count;
++			say("hakios: panel: %u brightness, %u blanking setters kept\n", kept_brightness_count,
++			    kept_blanked_count);
++		}
++	}
++}
++
++static void
++panel_retry(unsigned left)
++{
++	backlight_fixes();
++	if (left > 1) {
++		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
++		    dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
++			panel_retry(left - 1);
++		});
++	}
++}
++
+ /* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
+ 
+ /* IOKit's HID event system, the part that has no public header on Darwin (prototypes checked against 20F66) */
+@@ -899,6 +1139,9 @@ micros(uint64_t absolute)
+ 	return absolute * timebase.numer / timebase.denom / 1000;
+ }
+ 
++/* the same device under the name the kernel of this tree gives it (bsd/sys/hk_input.h) */
++#define HK_TOUCH_DEVICE_FALLBACK "/dev/hk-touch"
++
+ static void *
+ input_thread(__unused void *arg)
+ {
+@@ -920,6 +1163,11 @@ input_thread(__unused void *arg)
+ 		mach_timebase_info(&timebase);
+ 	}
+ 	device = open(HAKIOS_TOUCH_DEVICE, O_RDONLY);
++	if (device < 0 && errno == ENOENT) {
++		/* the kernel of this tree names the same device without the "ios" ("/dev/hk-touch",
++		   bsd/sys/hk_input.h, bsd/dev/hk_input.c); the samples are the same records */
++		device = open(HK_TOUCH_DEVICE_FALLBACK, O_RDONLY);
++	}
+ 	if (device < 0) {
+ 		say("hakios: input: %s: %s\n", HAKIOS_TOUCH_DEVICE, strerror(errno));
+ 		return NULL;
+@@ -1126,6 +1374,8 @@ hakios_init(void)
+ 		}
+ 		opengl_es();
+ 		window_server_fixes();
++		backlight_fixes();
++		panel_retry(8);
+ 		/*
+ 		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
+ 		 * screen service for its own ("still waiting for a main screen digitizer"), whether the
+diff --git a/userland/src/inject_sb.c b/userland/src/inject_sb.c
+index f93446d..09d7c8c 100644
+--- a/userland/src/inject_sb.c
++++ b/userland/src/inject_sb.c
+@@ -37,7 +37,9 @@
+ #include <dispatch/dispatch.h>
+ #include <dlfcn.h>
+ #include <fcntl.h>
++#include <mach/mach.h>
+ #include <mach/mach_time.h>
++#include <pthread.h>
+ #include <notify.h>
+ #include <objc/message.h>
+ #include <objc/runtime.h>
+@@ -69,6 +71,380 @@ say(const char *format, ...)
+ 	write(say_fd, line, (size_t)n);
+ }
+ 
++/*
++ * Diagnostics: the name of the service a blocking XPC call waits for. SpringBoard's main thread stood
++ * in mach_msg2_trap under ControlCenterServices->BaseBoard (ustacks, run 22) while the screen stayed on
++ * the boot logo, and a Mach request with a reply is the shape of that wait: every synchronous send says
++ * on the console (applog=1) which service it asks and when the answer came, so the one without an answer
++ * is the service the launch hangs on. The SDK here has no xpc.h, and the two functions are looked up in
++ * libxpc at load time.
++ */
++typedef struct _xpc_connection_s *hakios_xpc_connection;
++typedef struct _xpc_object_s *hakios_xpc_object;
++extern const char *xpc_connection_get_name(hakios_xpc_connection);
++extern hakios_xpc_object xpc_connection_send_message_with_reply_sync(hakios_xpc_connection, hakios_xpc_object);
++
++extern hakios_xpc_object xpc_dictionary_create(const hakios_xpc_object *keys, const hakios_xpc_object *values,
++    size_t count);
++
++/*
++ * An endpoint is what an NSXPCConnection to another process is made from; its description says which
++ * service it is for (an anonymous connection -- the one that never answers, run 25 -- is one made from
++ * an endpoint, so the name is here and not on the connection).
++ */
++extern hakios_xpc_object xpc_endpoint_create(hakios_xpc_connection connection);
++
++static hakios_xpc_object
++hakios_xpc_endpoint_create(hakios_xpc_connection connection)
++{
++	const char *service = connection != NULL ? xpc_connection_get_name(connection) : NULL;
++	hakios_xpc_object endpoint = xpc_endpoint_create(connection);
++
++	say("hakios: endpoint for %s\n", service != NULL ? service : "(none)");
++	return endpoint;
++}
++
++/*
++ * An anonymous connection is one made from an endpoint another process handed over, and a call on it
++ * is a call to that process. In run 25 one such call never returned and held a lock of CoreServices
++ * that SpringBoard's main thread waited for, so the launch stood still; an empty reply was returned
++ * instead and the launch went on -- but 510 of these calls in one run (run 31) all got that empty
++ * reply, and whatever SpringBoard asked of those processes it did not get.
++ *
++ * So the call is made here, on a thread of its own, and waited for only so long: a real reply is
++ * handed back as it is (the peers do answer, if they are alive), and only when one does not come in
++ * ANONYMOUS_MS is the empty reply returned to let the lock go. The peer's process and the code that
++ * asked are said, so a peer that never answers can be found.
++ */
++/*
++ * A live daemon on this phone answers in tens of seconds under the software render (backboardd's
++ * display call took twenty-nine and seventy-nine in run 34), and a daemon that is alive but has
++ * no answer for the call does not answer at all: chronod held the launch's main thread for the
++ * full two minutes of run 34 for nothing. So the process behind the connection is asked for its
++ * name, and only the window server and lsd are waited for as long as that; everything else gets
++ * two seconds (a service that is not even resolved yet gets that too -- launchd and the like
++ * answer in milliseconds).
++ */
++#define PEER_MS_LIVE    90000
++#define PEER_MS_FAST    2000
++
++static const char *
++peer_name(int pid, char *name, size_t size)
++{
++	struct kinfo_proc info;
++	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
++	size_t length = sizeof(info);
++
++	memset(&info, 0, sizeof(info));
++	if (sysctl(mib, 4, &info, &length, NULL, 0) != 0 || length == 0 || info.kp_proc.p_comm[0] == 0) {
++		return NULL;
++	}
++	strlcpy(name, info.kp_proc.p_comm, size);
++	return name;
++}
++
++static unsigned
++peer_wait_for(int pid, char *name, size_t size, const char **named)
++{
++	const char *peer = pid > 0 ? peer_name(pid, name, size) : NULL;
++
++	*named = peer;
++	if (peer != NULL && (strcmp(peer, "backboardd") == 0 || strcmp(peer, "lsd") == 0 ||
++	    strcmp(peer, "SpringBoard") == 0)) {
++		return PEER_MS_LIVE;
++	}
++	return PEER_MS_FAST;
++}
++
++extern pid_t xpc_connection_get_pid(hakios_xpc_connection);
++extern hakios_xpc_object xpc_retain(hakios_xpc_object);
++extern void xpc_release(hakios_xpc_object);
++
++struct hakios_call {
++	hakios_xpc_connection connection;
++	hakios_xpc_object message;
++	hakios_xpc_object reply;
++	bool done, dropped;
++	pthread_mutex_t lock;
++	pthread_cond_t wake;
++	struct hakios_call *next;
++};
++
++static pthread_mutex_t calls_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t calls_wake = PTHREAD_COND_INITIALIZER;
++static struct hakios_call *calls_first, *calls_last;
++static pthread_once_t calls_once = PTHREAD_ONCE_INIT;
++
++static void *
++hakios_calls_worker(__unused void *ignored)
++{
++	for (;;) {
++		struct hakios_call *call;
++		hakios_xpc_object reply;
++
++		pthread_mutex_lock(&calls_lock);
++		while (calls_first == NULL) {
++			pthread_cond_wait(&calls_wake, &calls_lock);
++		}
++		call = calls_first;
++		calls_first = call->next;
++		if (calls_first == NULL) {
++			calls_last = NULL;
++		}
++		pthread_mutex_unlock(&calls_lock);
++
++		reply = xpc_connection_send_message_with_reply_sync(call->connection, call->message);
++		xpc_release(call->message);
++		xpc_release((hakios_xpc_object)call->connection);
++		pthread_mutex_lock(&call->lock);
++		if (call->dropped) {
++			pthread_mutex_unlock(&call->lock);
++			if (reply != NULL) {
++				xpc_release(reply);
++			}
++			pthread_cond_destroy(&call->wake);
++			pthread_mutex_destroy(&call->lock);
++			free(call);
++			continue;
++		}
++		call->reply = reply;
++		call->done = true;
++		pthread_cond_signal(&call->wake);
++		pthread_mutex_unlock(&call->lock);
++	}
++	return NULL;
++}
++
++static void
++hakios_calls_start(void)
++{
++	/*
++	 * Four of them: one slow call (the display's own takes up to eighty seconds) must not hold
++	 * the others behind it -- in run 35 a single worker made every caller wait for the mapdb
++	 * calls that never ended.
++	 */
++	for (unsigned i = 0; i < 4; i++) {
++		pthread_t thread;
++
++		if (pthread_create(&thread, NULL, hakios_calls_worker, NULL) == 0) {
++			pthread_detach(thread);
++		}
++	}
++}
++
++/* the reply if it comes within ms, otherwise NULL (the call goes on without us) */
++static hakios_xpc_object
++hakios_call_within(hakios_xpc_connection connection, hakios_xpc_object message, unsigned ms)
++{
++	struct hakios_call *call;
++	struct timespec until;
++	hakios_xpc_object reply = NULL;
++
++	pthread_once(&calls_once, hakios_calls_start);
++	if ((call = calloc(1, sizeof(*call))) == NULL) {
++		return NULL;
++	}
++	pthread_mutex_init(&call->lock, NULL);
++	pthread_cond_init(&call->wake, NULL);
++	call->connection = (hakios_xpc_connection)xpc_retain((hakios_xpc_object)connection);
++	call->message = xpc_retain(message);
++
++	pthread_mutex_lock(&calls_lock);
++	if (calls_last != NULL) {
++		calls_last->next = call;
++	} else {
++		calls_first = call;
++	}
++	calls_last = call;
++	pthread_cond_signal(&calls_wake);
++	pthread_mutex_unlock(&calls_lock);
++
++	clock_gettime(CLOCK_REALTIME, &until);
++	until.tv_sec += ms / 1000;
++	until.tv_nsec += (long)(ms % 1000) * 1000000L;
++	if (until.tv_nsec >= 1000000000L) {
++		until.tv_sec++;
++		until.tv_nsec -= 1000000000L;
++	}
++	pthread_mutex_lock(&call->lock);
++	while (!call->done) {
++		if (pthread_cond_timedwait(&call->wake, &call->lock, &until) != 0) {
++			break;
++		}
++	}
++	if (call->done) {
++		reply = call->reply;
++		pthread_mutex_unlock(&call->lock);
++		pthread_cond_destroy(&call->wake);
++		pthread_mutex_destroy(&call->lock);
++		free(call);
++	} else {
++		call->dropped = true;
++		pthread_mutex_unlock(&call->lock);
++	}
++	return reply;
++}
++
++static void
++hakios_where(void *address, char *out, size_t size)
++{
++	Dl_info info;
++
++	if (address == NULL || dladdr(address, &info) == 0 || info.dli_fname == NULL) {
++		snprintf(out, size, "?");
++		return;
++	}
++	snprintf(out, size, "%s+%#lx", strrchr(info.dli_fname, '/') != NULL ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname,
++	    (unsigned long)((uintptr_t)address - (uintptr_t)info.dli_fbase));
++}
++
++static hakios_xpc_object
++hakios_xpc_send_sync(hakios_xpc_connection connection, hakios_xpc_object message)
++{
++	const char *service = connection ? xpc_connection_get_name(connection) : NULL;
++	hakios_xpc_object reply;
++	int pid = connection ? (int)xpc_connection_get_pid(connection) : 0;
++	const char *named = NULL;
++	char peer[24];
++	unsigned wait_ms;
++	static unsigned asked, answered, lost;
++	void *caller0 = __builtin_return_address(0), *caller1 = __builtin_return_address(1);
++	char where[160];
++
++	if (connection == NULL || (service == NULL && pid <= 0)) {
++		/* no peer is named, so no reply can come: the empty one at once, without a wait at all */
++		return xpc_dictionary_create(NULL, NULL, 0);
++	}
++	asked++;
++	hakios_where(caller0, where, sizeof(where));
++	wait_ms = peer_wait_for(pid, peer, sizeof(peer), &named);
++	/*
++	 * LaunchServices' mapdb calls do not answer at all (lsd is alive but never replies: run 35
++	 * waited five times for ninety seconds on its own main thread and the launch stood still for
++	 * seven and a half minutes), and the launch does not need them to come to the lock screen.
++	 */
++	if ((service != NULL && strstr(service, ".mapdb") != NULL) ||
++	    strstr(where, "Foundation+0x99314") != NULL) {
++		wait_ms = PEER_MS_FAST;
++	}
++	if (asked <= 8) {
++		say("hakios: xpc %s pid %d (%s): %u ms\n", service != NULL ? service : "(none)", pid,
++		    named != NULL ? named : "unresolved", wait_ms);
++	}
++	reply = hakios_call_within(connection, message, wait_ms);
++	if (reply != NULL) {
++		answered++;
++		if (answered <= 12) {
++			say("hakios: xpc %s pid %d (%s) answered (%s)\n", service != NULL ? service : "(none)",
++			    pid, named != NULL ? named : "unresolved", where);
++		}
++		return reply;
++	}
++	lost++;
++	if (lost <= 10) {
++		char up[160];
++
++		hakios_where(caller1, up, sizeof(up));
++		say("hakios: xpc %s pid %d (%s): nothing in %u ms (%s <- %s)\n",
++		    service != NULL ? service : "(none)", pid, named != NULL ? named : "unresolved", wait_ms,
++		    where, up);
++	} else if (asked % 100 == 0) {
++		say("hakios: xpc: %u asked, %u answered, %u empty\n", asked, answered, lost);
++	}
++	return xpc_dictionary_create(NULL, NULL, 0);
++}
++
++/*
++ * Every name SpringBoard looks up in its bootstrap namespace, with what came back -- the last one without
++ * a port (or without a "created" line after it) is the service the launch stopped at.
++ */
++extern int bootstrap_look_up2(mach_port_t bootstrap_port, const char *service_name, mach_port_t *service_port,
++    pid_t target_pid, uint64_t flags);
++extern hakios_xpc_connection xpc_connection_create_mach_service(const char *name, void *target_queue, uint64_t flags);
++
++static int
++hakios_bootstrap_look_up2(mach_port_t bootstrap_port, const char *service_name, mach_port_t *service_port,
++    pid_t target_pid, uint64_t flags)
++{
++	int result;
++
++	say("hakios: lookup -> %s\n", service_name ? service_name : "(null)");
++	result = bootstrap_look_up2(bootstrap_port, service_name, service_port, target_pid, flags);
++	say("hakios: lookup <- %s %d\n", service_name ? service_name : "(null)", result);
++	return result;
++}
++
++static hakios_xpc_connection
++hakios_xpc_create_mach_service(const char *name, void *target_queue, uint64_t flags)
++{
++	say("hakios: connect -> %s\n", name ? name : "(null)");
++	return xpc_connection_create_mach_service(name, target_queue, flags);
++}
++
++/*
++ * The names of the frames of a stack, as the runtime says them, are looked up by dyld walking every
++ * image of the shared cache. Here the cache is four gigabytes on the phone's flash, read through
++ * the driver when a page is first touched, so one such lookup in run 28 kept SpringBoard's main
++ * thread in dyld for minutes at a time -- eighteen of twenty-five dumps of the launch found it
++ * there, in backtrace_symbols called to format %@ in a log message -- and the launch never reached
++ * its first frame. A stack in a log line is worth nothing next to the screen, so this one is not
++ * looked up: the frames are named "(no symbols)" and the caller is said once.
++ */
++extern char **backtrace_symbols(void *const *buffer, int size);
++extern void backtrace_symbols_fd(void *const *buffer, int size, int fd);
++
++static unsigned backtraces;
++
++static char **
++hakios_backtrace_symbols(void *const *buffer, int size)
++{
++	char **names;
++
++	if (size <= 0) {
++		return NULL;
++	}
++	if (backtraces++ < 3) {
++		Dl_info info;
++		void *caller = __builtin_return_address(0);
++
++		if (dladdr(caller, &info) != 0 && info.dli_fname != NULL) {
++			const char *slash = strrchr(info.dli_fname, '/');
++
++			say("hakios: a stack is asked for by %s+%#lx (not looked up)\n",
++			    slash != NULL ? slash + 1 : info.dli_fname,
++			    (unsigned long)((uintptr_t)caller - (uintptr_t)info.dli_fbase));
++		}
++	}
++	if ((names = malloc((size_t)size * sizeof(char *))) == NULL) {
++		return NULL;
++	}
++	for (int i = 0; i < size; i++) {
++		names[i] = strdup("(no symbols)");
++	}
++	return names;
++}
++
++static void
++hakios_backtrace_symbols_fd(void *const *buffer, int size, int fd)
++{
++	(void)buffer;
++	(void)size;
++	(void)fd;
++	backtraces++;
++}
++
++__attribute__((used)) static struct {
++	const void *replacement;
++	const void *replacee;
++} hakios_interpose_xpc[] __attribute__((section("__DATA,__interpose"))) = {
++	{ (const void *)hakios_xpc_send_sync, (const void *)xpc_connection_send_message_with_reply_sync },
++	{ (const void *)hakios_bootstrap_look_up2, (const void *)bootstrap_look_up2 },
++	{ (const void *)hakios_xpc_create_mach_service, (const void *)xpc_connection_create_mach_service },
++	{ (const void *)hakios_xpc_endpoint_create, (const void *)xpc_endpoint_create },
++	{ (const void *)hakios_backtrace_symbols, (const void *)backtrace_symbols },
++	{ (const void *)hakios_backtrace_symbols_fd, (const void *)backtrace_symbols_fd },
++};
++
+ /*
+  * Boot-arg touch_lat=1: a line for every turn of SpringBoard's main run loop -- when it woke up (a
+  * touch, a timer, the display link ...), when CoreAnimation's commit of what that turn changed
+@@ -87,6 +463,160 @@ now_us(void)
+ 	return mach_absolute_time() * timebase.numer / timebase.denom / 1000;
+ }
+ 
++/*
++ * Diagnostics (boot-arg sb_threads=<seconds>; absent or 0 is off): every <seconds> the stack of every
++ * thread of this process, each address named the way dyld knows it (dladdr: the image's file name, and
++ * its symbol when the image exports one). The stacks the kernel prints (ustacks=) stop at sixteen
++ * frames and know no names, and 3 threads is too little to tell an idle run loop from a wait: this
++ * says what each thread stands in, so the one that keeps the window server from the first frame is
++ * named. The run loop of the main thread is watched from here as well: "woke N ms ago" tells whether
++ * the main thread is alive at all.
++ */
++static mach_port_t sb_main_thread;
++static uint64_t sb_main_woke;           /* us, when the main run loop last woke up; 0: not yet */
++
++static void
++main_woke_note(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, __unused void *info)
++{
++	if (activity == kCFRunLoopAfterWaiting) {
++		sb_main_woke = now_us();
++	}
++}
++
++static void
++symbol_of(uint64_t address, char *out, size_t size)
++{
++	Dl_info info;
++
++	if (dladdr((const void *)(uintptr_t)address, &info) != 0 && info.dli_fname != NULL) {
++		const char *slash = strrchr(info.dli_fname, '/');
++		const char *image = slash != NULL ? slash + 1 : info.dli_fname;
++
++		if (info.dli_sname != NULL) {
++			snprintf(out, size, "%s %s+%#lx", image, info.dli_sname,
++			    (unsigned long)(address - (uint64_t)(uintptr_t)info.dli_saddr));
++		} else {
++			snprintf(out, size, "%s+%#lx", image, (unsigned long)(address - (uint64_t)(uintptr_t)info.dli_fbase));
++		}
++	} else {
++		snprintf(out, size, "%#llx", (unsigned long long)address);
++	}
++}
++
++/* One thread's stack, one frame a line: /dev/console cuts a long line and drops it when busy. */
++static void
++say_thread_stack(int index, bool main_thread, uint64_t pc, uint64_t fp)
++{
++	char line[300];
++	char symbol[220];
++	int depth;
++
++	symbol_of(pc, symbol, sizeof(symbol));
++	snprintf(line, sizeof(line), "hakios: t%d%s %s\n", index, main_thread ? "(main)" : "", symbol);
++	write(say_fd, line, strlen(line));
++	for (depth = 1; depth <= 14 && fp != 0; depth++) {
++		uint64_t frame[2] = { 0, 0 };
++		vm_size_t got = 0;
++
++		if ((fp & 7) != 0 || fp < 0x10000) {
++			break;
++		}
++		if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof(frame),
++		    (vm_address_t)frame, &got) != KERN_SUCCESS || got != sizeof(frame)) {
++			break;
++		}
++		if (frame[1] < 0x1000) {
++			break;
++		}
++		symbol_of(frame[1], symbol, sizeof(symbol));
++		snprintf(line, sizeof(line), "hakios: t%d#%d %s\n", index, depth, symbol);
++		write(say_fd, line, strlen(line));
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++}
++
++static void
++say_all_threads(void)
++{
++	thread_act_array_t threads = NULL;
++	mach_msg_type_number_t count = 0;
++	unsigned i;
++
++	if (sb_main_woke != 0) {
++		say("hakios: threads: the main run loop woke %llu ms ago\n", (unsigned long long)((now_us() - sb_main_woke) / 1000));
++	} else {
++		say("hakios: threads: the main run loop has not woken yet\n");
++	}
++	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
++		say("hakios: threads: task_threads failed\n");
++		return;
++	}
++	say("hakios: threads: %u\n", count);
++	for (i = 0; i < count; i++) {
++		arm_thread_state64_t state;
++		mach_msg_type_number_t size = ARM_THREAD_STATE64_COUNT;
++
++		if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&state, &size) != KERN_SUCCESS) {
++			continue;
++		}
++		say_thread_stack((int)i, threads[i] == sb_main_thread, arm_thread_state64_get_pc(state),
++		    arm_thread_state64_get_fp(state));
++	}
++	for (i = 0; i < count; i++) {
++		mach_port_deallocate(mach_task_self(), threads[i]);
++	}
++	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
++}
++
++static void *
++threads_watchdog(void *argument)
++{
++	double seconds = *(double *)argument;
++
++	free(argument);
++	for (;;) {
++		sleep((unsigned)seconds);
++		say_all_threads();
++	}
++	return NULL;
++}
++
++static void
++watch_threads(const char *arguments)
++{
++	const char *setting = strstr(arguments, "sb_threads=");
++	pthread_t thread;
++	double *seconds;
++
++	if (setting == NULL || (setting != arguments && setting[-1] != ' ')) {
++		return;
++	}
++	if ((seconds = malloc(sizeof(*seconds))) == NULL) {
++		return;
++	}
++	*seconds = atof(setting + 11);
++	if (*seconds <= 0) {
++		free(seconds);
++		return;
++	}
++	if (timebase.denom == 0) {
++		mach_timebase_info(&timebase);
++	}
++	sb_main_thread = mach_thread_self();    /* this constructor runs on the main thread */
++	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, 0,
++	    main_woke_note, NULL), kCFRunLoopCommonModes);
++	if (pthread_create(&thread, NULL, threads_watchdog, seconds) != 0) {
++		free(seconds);
++		say("hakios: threads: no watchdog\n");
++		return;
++	}
++	pthread_detach(thread);
++	say("hakios: threads: a stack of every thread every %.0f s\n", *seconds);
++}
++
+ static void
+ main_loop_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info)
+ {
+@@ -1246,6 +1776,322 @@ load_tweaks(void)
+ 	}
+ }
+ 
++/*
++ * An exception that ends the process is said on the console in full here: the runtime prints
++ * "*** Terminating app due to uncaught exception ... reason:" itself, but the console cuts the line
++ * (run 26: "*** -[__NSSetM removeObject:]: object ca"), and what follows -- the stack -- is the part
++ * that says which code of SpringBoard did it.
++ */
++extern void NSSetUncaughtExceptionHandler(void (*handler)(id exception));
++
++/*
++ * The method of this process that a stack address belongs to: the call stacks that come with an
++ * exception name the image and an offset only (the shared cache has no method symbols), and the
++ * class that does a wrong thing is what one needs to see.
++ */
++static bool
++sb_method_at(void *address, char *out, size_t size)
++{
++	int count = objc_getClassList(NULL, 0), i;
++	Class *classes;
++
++	if (count <= 0 || (classes = malloc(sizeof(Class) * (size_t)count)) == NULL) {
++		return false;
++	}
++	count = objc_getClassList(classes, count);
++	for (i = 0; i < count; i++) {
++		int kind;
++
++		for (kind = 0; kind < 2; kind++) {
++			Class cls = kind == 0 ? classes[i] : object_getClass((id)classes[i]);
++			unsigned n = 0, j;
++			Method *methods = class_copyMethodList(cls, &n);
++
++			if (methods == NULL) {
++				continue;
++			}
++			for (j = 0; j < n; j++) {
++				if ((void *)method_getImplementation(methods[j]) == address) {
++					snprintf(out, size, "%c[%s %s]", kind == 0 ? '-' : '+', class_getName(classes[i]),
++					    sel_getName(method_getName(methods[j])));
++					free(methods);
++					free(classes);
++					return true;
++				}
++			}
++			free(methods);
++		}
++	}
++	free(classes);
++	return false;
++}
++
++static void (*original_remove_object)(id, SEL, id);
++
++static void
++sb_remove_object(id self, SEL selector, id object)
++{
++	if (object == NULL) {
++		/* Taking nil out of a set is a no-op by intent; __NSSetM only refuses to be asked. SpringBoard
++		   does ask (run 27, at its own +0x260ab4) and ends on it, so the question is not put to it. */
++		say("hakios: removeObject:nil ignored on %s\n", class_getName(object_getClass(self)));
++		return;
++	}
++	original_remove_object(self, selector, object);
++}
++
++/*
++ * The names of the frames of a stack ("+[NSThread callStackSymbols]", "-[NSException
++ * callStackSymbols]") are looked up by dyld, walking every image of the shared cache, which here is
++ * gigabytes on the phone's flash: in run 31 SpringBoard's main thread was found in the middle of
++ * that lookup in most dumps of its launch, always reached from Foundation formatting a %@ in some
++ * log line. A stack in a log is worth nothing next to the screen, so these two answer with one
++ * frame and the lookup is not made. (The method is hooked and not the library function: the call
++ * comes from the shared cache, whose references the interposing table does not reach.)
++ */
++static id
++sb_no_stack_symbols(__unused id self, __unused SEL selector)
++{
++	static id names;
++
++	if (names == NULL) {
++		id text = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSString"), sel_registerName("alloc"));
++
++		text = ((id (*)(id, SEL, const char *))objc_msgSend)(text, sel_registerName("initWithUTF8String:"),
++		    "(no symbols)");
++		names = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSArray"), sel_registerName("alloc"));
++		names = ((id (*)(id, SEL, id *, unsigned long))objc_msgSend)(names, sel_registerName("initWithObjects:count:"),
++		    &text, 1);
++	}
++	return names;
++}
++
++/*
++ * The interposing table does not reach a call made inside dyld_shared_cache: the cache's own
++ * references were bound when it was built, so Foundation there calls the libsystem_c function
++ * itself (run 32: t0(main) in dyld under backtrace_symbols+0x74, from Foundation formatting a %@
++ * -- most dumps of that launch). The function's first instructions are therefore replaced by a
++ * jump to ours: ldr x16, #8; br x16; .quad <ours>. The page is made writable for the moment, which
++ * the shared cache's private copy allows, and the instruction cache is told.
++ */
++extern void sys_icache_invalidate(void *start, size_t length);
++
++static bool
++sb_patch_prologue(void *target, void *replacement)
++{
++	uint32_t code[4];
++	uint64_t address = (uint64_t)replacement;
++	uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
++	uintptr_t first, last;
++	kern_return_t kr;
++
++	if (target == NULL || replacement == NULL) {
++		return false;
++	}
++	first = (uintptr_t)target & ~(page - 1);
++	last = ((uintptr_t)target + sizeof(code) - 1) & ~(page - 1);
++	kr = vm_protect(mach_task_self(), (vm_address_t)first, (vm_size_t)(last - first + page), FALSE,
++	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
++	if (kr != KERN_SUCCESS) {
++		say("hakios: %p cannot be made writable (%d)\n", target, (int)kr);
++		return false;
++	}
++	code[0] = 0x58000050;                   /* ldr x16, #8 */
++	code[1] = 0xd61f0200;                   /* br x16 */
++	memcpy(&code[2], &address, sizeof(address));
++	memcpy(target, code, sizeof(code));
++	sys_icache_invalidate(target, sizeof(code));
++	(void)vm_protect(mach_task_self(), (vm_address_t)first, (vm_size_t)(last - first + page), FALSE,
++	    VM_PROT_READ | VM_PROT_EXECUTE);
++	return true;
++}
++
++/*
++ * The place of the real function is in our interposing table: dyld binds its second column to the
++ * symbol as it was before the table replaced it, which is the libsystem_c entry (dlsym would give
++ * our own replacement back, since it is the one dyld has for the name now).
++ */
++static void *
++sb_bound_original(const void *replacement)
++{
++	size_t count = sizeof(hakios_interpose_xpc) / sizeof(hakios_interpose_xpc[0]);
++
++	for (size_t i = 0; i < count; i++) {
++		if (hakios_interpose_xpc[i].replacement == replacement) {
++			return (void *)hakios_interpose_xpc[i].replacee;
++		}
++	}
++	return NULL;
++}
++
++static void
++sb_patch_backtrace(void)
++{
++	void *symbols = sb_bound_original((const void *)hakios_backtrace_symbols);
++	void *symbols_fd = sb_bound_original((const void *)hakios_backtrace_symbols_fd);
++	Dl_info info;
++
++	if (symbols == NULL || dladdr(symbols, &info) == 0 || info.dli_fname == NULL ||
++	    strstr(info.dli_fname, "libsystem_c") == NULL) {
++		const char *fallback = "dlsym";
++
++		symbols = dlsym(RTLD_DEFAULT, "backtrace_symbols");
++		symbols_fd = dlsym(RTLD_DEFAULT, "backtrace_symbols_fd");
++		(void)fallback;
++	}
++	if (symbols != NULL && symbols != (void *)hakios_backtrace_symbols) {
++		say("hakios: backtrace_symbols %p is patched: %s\n", symbols,
++		    sb_patch_prologue(symbols, (void *)hakios_backtrace_symbols) ? "yes" : "no");
++	} else {
++		say("hakios: no address for backtrace_symbols (%p)\n", symbols);
++	}
++	if (symbols_fd != NULL && symbols_fd != (void *)hakios_backtrace_symbols_fd) {
++		(void)sb_patch_prologue(symbols_fd, (void *)hakios_backtrace_symbols_fd);
++	}
++}
++
++static void
++sb_cheap_stacks(void)
++{
++	Class cls;
++	Method method;
++
++	if ((cls = objc_getClass("NSThread")) != NULL &&
++	    (method = class_getClassMethod(cls, sel_registerName("callStackSymbols"))) != NULL) {
++		method_setImplementation(method, (IMP)sb_no_stack_symbols);
++		say("hakios: +[NSThread callStackSymbols] is cheap now\n");
++	}
++	if ((cls = objc_getClass("NSException")) != NULL &&
++	    (method = class_getInstanceMethod(cls, sel_registerName("callStackSymbols"))) != NULL) {
++		method_setImplementation(method, (IMP)sb_no_stack_symbols);
++		say("hakios: -[NSException callStackSymbols] is cheap now\n");
++	}
++}
++
++/*
++ * IconServices asks its agent for an icon with a synchronous XPC call from SpringBoard's main
++ * thread, and the call is bound inside dyld_shared_cache: it does not pass our interposing table
++ * (run 34: t0(main) in xpc_connection_send_message_with_reply_sync under IconServices). The
++ * connection's own send method is replaced instead. The icon service is answered with nothing at
++ * once -- an icon that is not there is something IconServices handles -- and every other call is
++ * passed on untouched.
++ */
++static IMP original_send_invocation;
++
++static void
++sb_nsxpc_send(id self, SEL command, id invocation, id *arguments, unsigned long long count,
++    id signature, SEL called, id proxy)
++{
++	Class string_class = objc_getClass("NSString");
++	id name = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("serviceName"));
++
++	if (name != nil && string_class != NULL && ((BOOL (*)(id, SEL, Class))objc_msgSend)(name,
++	    sel_registerName("isKindOfClass:"), string_class)) {
++		const char *service = ((const char *(*)(id, SEL))objc_msgSend)(name, sel_registerName("UTF8String"));
++
++		if (service != NULL && strstr(service, "iconservices") != NULL) {
++			static unsigned skipped;
++			unsigned long length = signature != nil ? ((unsigned long (*)(id, SEL))objc_msgSend)(signature,
++			    sel_registerName("methodReturnLength")) : 0;
++			const char *kind = signature != nil ? ((const char *(*)(id, SEL))objc_msgSend)(signature,
++			    sel_registerName("methodReturnType")) : NULL;
++
++			if (invocation != nil && length <= 64 && kind != NULL && (kind[0] == '@' || kind[0] == 'v')) {
++				char zero[64] = { 0 };
++
++				((void (*)(id, SEL, void *))objc_msgSend)(invocation,
++				    sel_registerName("setReturnValue:"), zero);
++			}
++			if (skipped++ < 6) {
++				say("hakios: %s to %s: not sent, answered with nothing (%s)\n", sel_getName(called),
++				    service, kind != NULL ? kind : "?");
++			}
++			return;
++		}
++	}
++	if (original_send_invocation != NULL) {
++		((void (*)(id, SEL, id, id *, unsigned long long, id, SEL, id))original_send_invocation)(self,
++		    command, invocation, arguments, count, signature, called, proxy);
++	}
++}
++
++static void
++sb_nsxpc_hook(void)
++{
++	Class cls = objc_getClass("NSXPCConnection");
++	Method method = cls != NULL ? class_getInstanceMethod(cls,
++	    sel_registerName("_sendInvocation:orArguments:count:methodSignature:selector:withProxy:")) : NULL;
++
++	if (method == NULL) {
++		say("hakios: no -[NSXPCConnection _sendInvocation:...]; icon calls left as they are\n");
++		return;
++	}
++	original_send_invocation = method_getImplementation(method);
++	method_setImplementation(method, (IMP)sb_nsxpc_send);
++	say("hakios: NSXPCConnection sends are watched (iconservices is not waited for)\n");
++}
++
++static void
++sb_nil_tolerant_set(void)
++{
++	Class cls = objc_getClass("__NSSetM");
++	Method method = cls != NULL ? class_getInstanceMethod(cls, sel_registerName("removeObject:")) : NULL;
++
++	if (method == NULL) {
++		say("hakios: no __NSSetM removeObject: to soften\n");
++		return;
++	}
++	original_remove_object = (void (*)(id, SEL, id))method_getImplementation(method);
++	method_setImplementation(method, (IMP)sb_remove_object);
++}
++
++static const char *
++sb_text(id object)
++{
++	return object != NULL ? ((const char *(*)(id, SEL))objc_msgSend)(object, sel_registerName("UTF8String")) : "(nil)";
++}
++
++static void
++sb_uncaught_exception(id exception)
++{
++	const char *name = sb_text(((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("name")));
++	const char *reason = sb_text(((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("reason")));
++	id addresses;
++	unsigned long frames, frame;
++
++	/*
++	 * Short lines only, and nothing that symbolizes: the console drops a long line and the process
++	 * ends right after this, so this must not be the slow part (run 28 stood for many minutes in
++	 * callStackSymbols here).
++	 */
++	say("hakios: EXC %s\n", name);
++	for (size_t at = 0; reason != NULL && reason[at] != 0; at += 60) {
++		say("hakios: EXC %.*s\n", 60, reason + at);
++	}
++	addresses = ((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("callStackReturnAddresses"));
++	frames = addresses != NULL ? ((unsigned long (*)(id, SEL))objc_msgSend)(addresses, sel_registerName("count")) : 0;
++	for (frame = 0; frame < frames && frame < 24; frame++) {
++		Dl_info info;
++		char method[256];
++		id number = ((id (*)(id, SEL, unsigned long))objc_msgSend)(addresses, sel_registerName("objectAtIndex:"), frame);
++		void *pc = (void *)(uintptr_t)((unsigned long long (*)(id, SEL))objc_msgSend)(number,
++		    sel_registerName("unsignedLongLongValue"));
++
++		if (dladdr(pc, &info) == 0 || info.dli_fname == NULL ||
++		    (strstr(info.dli_fname, "/SpringBoard") == NULL && strstr(info.dli_fname, "libhakios.sb") == NULL)) {
++			continue;
++		}
++		if (sb_method_at(pc, method, sizeof(method))) {
++			say("hakios: EXC f%lu %s\n", frame, method);
++		} else {
++			const char *slash = strrchr(info.dli_fname, '/');
++
++			say("hakios: EXC f%lu %s+%#lx\n", frame, slash != NULL ? slash + 1 : info.dli_fname,
++			    (unsigned long)((uintptr_t)pc - (uintptr_t)info.dli_fbase));
++		}
++	}
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_springboard_init(void)
+@@ -1280,6 +2126,11 @@ hakios_springboard_init(void)
+ 	 * this one opens it, the way a jailbreak's own hook does.
+ 	 */
+ 	load_tweaks();
++	NSSetUncaughtExceptionHandler(sb_uncaught_exception);
++	sb_nil_tolerant_set();
++	sb_cheap_stacks();
++	sb_nsxpc_hook();
++	sb_patch_backtrace();
+ 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+ 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);
+ 	original_set_setup_required_reason = (void (*)(id, SEL, long))replace_method("SBSetupManager",
+@@ -1365,9 +2216,12 @@ hakios_springboard_init(void)
+ 		size_t size = sizeof(args) - 1;
+ 		const char *delay;
+ 
+-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (delay = strstr(args, "sb_delay=")) != NULL &&
+-		    (delay == args || delay[-1] == ' ')) {
+-			usleep((useconds_t)(atof(delay + 9) * 1e6));
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++			watch_threads(args);
++			delay = strstr(args, "sb_delay=");
++			if (delay != NULL && (delay == args || delay[-1] == ' ')) {
++				usleep((useconds_t)(atof(delay + 9) * 1e6));
++			}
+ 		}
+ 	}
+ 	/*
+diff --git a/userland/src/var_store.c b/userland/src/var_store.c
+index 84f246b..b2e0cd3 100644
+--- a/userland/src/var_store.c
++++ b/userland/src/var_store.c
+@@ -19,7 +19,7 @@
+  *   var_store erase         forget both slots (the next boot starts empty again)
+  *   var_store stamp PATH    write a line into PATH saying when: a marker for a run
+  *
+- * Nobody has to remember to save. `watch` registers with the kernel (kern.hakios.var_save), and
++ * Nobody has to remember to save. `watch` registers with the kernel (kern.hackios.var_save), and
+  * on the orderly way back to the loader -- the run's time up, or "xl stop" -- the kernel asks it
+  * for the volume and waits, bounded, before it goes (drivers/storage/hakios.ufs.c,
+  * hakios_var_save_on_return). A save every SECS seconds is there as well but is not the default:
+@@ -27,7 +27,7 @@
+  * storage is read through the loader rather than through this kernel's own driver.
+  *
+  * One saver at a time: a write to the store is refused unless the writer holds the claim
+- * (kern.hakios.var_busy), so two of them cannot interleave into one slot. Even if they did, the
++ * (kern.hackios.var_busy), so two of them cannot interleave into one slot. Even if they did, the
+  * slot being written is never the one holding the newest good archive, and a header is written
+  * last and over a zeroed one -- so the worst an interrupted or doubled save can do is lose itself.
+  *
+@@ -168,7 +168,7 @@ sysctl_set_int(const char *name, int value)
+ static int
+ claim(void)
+ {
+-	if (sysctl_set_int("kern.hakios.var_busy", 1) != 0) {
++	if (sysctl_set_int("kern.hackios.var_busy", 1) != 0) {
+ 		printf("var_store: the store is claimed by another saver (%s)\n", strerror(errno));
+ 		return 0;
+ 	}
+@@ -178,7 +178,7 @@ claim(void)
+ static void
+ release(void)
+ {
+-	(void)sysctl_set_int("kern.hakios.var_busy", 0);
++	(void)sysctl_set_int("kern.hackios.var_busy", 0);
+ }
+ 
+ /* ---- checksum (the same one the loader reads a write back with) ---- */
+@@ -1275,7 +1275,7 @@ watch(int seconds)
+ 	}
+ 	close(fd);
+ 	fd = -1;
+-	if (sysctl_set_int("kern.hakios.var_save", VAR_SAVE_IDLE) != 0) {
++	if (sysctl_set_int("kern.hackios.var_save", VAR_SAVE_IDLE) != 0) {
+ 		printf("var_store: this kernel does not keep the data volume (%s)\n", strerror(errno));
+ 		return 0;
+ 	}
+@@ -1291,7 +1291,7 @@ watch(int seconds)
+ 		struct timeval tv = { 0, 0 };
+ 		int state = VAR_SAVE_NONE;
+ 
+-		if (sysctl_int("kern.hakios.var_save", &state) == 0 && state == VAR_SAVE_WANTED) {
++		if (sysctl_int("kern.hackios.var_save", &state) == 0 && state == VAR_SAVE_WANTED) {
+ 			asked = 1;
+ 		}
+ 		gettimeofday(&tv, NULL);
+@@ -1304,7 +1304,7 @@ watch(int seconds)
+ 			last = (uint64_t)tv.tv_sec;
+ 			if (asked) {
+ 				/* answered either way: the kernel is waiting on this to go back to the loader */
+-				(void)sysctl_set_int("kern.hakios.var_save", VAR_SAVE_DONE);
++				(void)sysctl_set_int("kern.hackios.var_save", VAR_SAVE_DONE);
+ 				return ok;
+ 			}
+ 		}
+diff --git a/userland/var/mobile/Library/Preferences/com.apple.migration.plist b/userland/var/mobile/Library/Preferences/com.apple.migration.plist
+index 0a3f423..d3b80e3 100644
+Binary files a/userland/var/mobile/Library/Preferences/com.apple.migration.plist and b/userland/var/mobile/Library/Preferences/com.apple.migration.plist differ
+diff --git a/userland/var/mobile/Library/Preferences/com.apple.purplebuddy.plist b/userland/var/mobile/Library/Preferences/com.apple.purplebuddy.plist
+index a8908e4..3251557 100644
+Binary files a/userland/var/mobile/Library/Preferences/com.apple.purplebuddy.plist and b/userland/var/mobile/Library/Preferences/com.apple.purplebuddy.plist differ
+diff --git a/userland/var/mobile/Library/Preferences/com.apple.springboard.plist b/userland/var/mobile/Library/Preferences/com.apple.springboard.plist
+index dc39f07..7f6b71c 100644
+Binary files a/userland/var/mobile/Library/Preferences/com.apple.springboard.plist and b/userland/var/mobile/Library/Preferences/com.apple.springboard.plist differ

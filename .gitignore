@@ -1,0 +1,3 @@
+logs/
+# 976 MB resident image: rebuild it with FLASHBOOT=1 ./build.sh
+prebuilt/flashboot.apfs
